@@ -2,6 +2,11 @@ module github.com/BRUHItsABunny/gOkHttp-download
 
 go 1.19
 
+replace (
+	github.com/cornelk/hashmap v1.0.8 => github.com/BRUHItsABunny/hashmap v0.0.0-20221125164545-8b59f13d589a
+	go.uber.org/atomic v1.10.0 => github.com/BRUHItsABunny/atomic v0.0.0-20221125214309-9e798cd18888
+)
+
 require (
 	github.com/BRUHItsABunny/crypto-utils v0.0.5
 	github.com/BRUHItsABunny/gOkHttp v0.2.9
