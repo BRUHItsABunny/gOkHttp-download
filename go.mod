@@ -14,7 +14,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/etherlabsio/go-m3u8 v1.0.0
 	github.com/joho/godotenv v1.5.1
-	github.com/yapingcat/gomedia v0.0.0-20230601130610-1ce7ce182788
+	github.com/yapingcat/gomedia v0.0.0-20240906162731-17feea57090c
 	go.uber.org/atomic v1.10.0
 	golang.org/x/sync v0.1.0
 )
