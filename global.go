@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/BRUHItsABunny/gOkHttp/requests"
 	"github.com/BRUHItsABunny/gOkHttp/responses"
-	"github.com/cornelk/hashmap"
 	"github.com/dustin/go-humanize"
 	"go.uber.org/atomic"
 	"net/http"
@@ -20,14 +19,14 @@ type GlobalDownloadTracker struct {
 	sync.WaitGroup
 	GraceFulStop *atomic.Bool `json:"-"`
 	// Idle stats
-	IdleSince   *atomic.Time   `json:"idleSince"`
+	IdleSince   *CustomTime    `json:"idleSince"`
 	IdleValue   *atomic.Uint64 `json:"-"`
 	IdleTimeout *atomic.Int64  `json:"-"`
 	// MetaData
-	LastTick     *atomic.Time                       `json:"lastTick"`
-	CurrentIP    *atomic.String                     `json:"currentIP"`
-	TotalThreads *atomic.Uint64                     `json:"totalThreads"`
-	Tasks        *hashmap.Map[string, DownloadTask] `json:"tasks"`
+	LastTick     *CustomTime                    `json:"lastTick"`
+	CurrentIP    *atomic.String                 `json:"currentIP"`
+	TotalThreads *atomic.Uint64                 `json:"totalThreads"`
+	Tasks        *TaskMap[string, DownloadTask] `json:"tasks"`
 	// Total stats
 	TotalFiles *atomic.Uint64 `json:"totalFiles"`
 	TotalBytes *atomic.Uint64 `json:"totalBytes"`
@@ -43,12 +42,12 @@ func NewGlobalDownloadTracker(idleTimeout time.Duration) *GlobalDownloadTracker 
 		WaitGroup:       sync.WaitGroup{},
 		GraceFulStop:    atomic.NewBool(false),
 		IdleValue:       atomic.NewUint64(0),
-		IdleSince:       atomic.NewTime(time.Time{}),
+		IdleSince:       NewCustomTime(time.Time{}),
 		IdleTimeout:     atomic.NewInt64(int64(idleTimeout)),
-		LastTick:        atomic.NewTime(time.Now()),
+		LastTick:        NewCustomTime(time.Now()),
 		CurrentIP:       atomic.NewString(""),
 		TotalThreads:    atomic.NewUint64(0),
-		Tasks:           hashmap.New[string, DownloadTask](),
+		Tasks:           &TaskMap[string, DownloadTask]{},
 		TotalFiles:      atomic.NewUint64(0),
 		TotalBytes:      atomic.NewUint64(0),
 		DownloadedFiles: atomic.NewUint64(0),
