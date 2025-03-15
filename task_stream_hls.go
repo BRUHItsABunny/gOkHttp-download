@@ -114,6 +114,17 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 		fileLocation += ".ts"
 	}
 	fileName := filepath.Base(fileLocation)
+	fileDir := filepath.Dir(fileName)
+
+	err := os.MkdirAll(fileDir, os.ModePerm)
+	if err != nil {
+		return nil, fmt.Errorf("os.MkdirAll: %w", err)
+	}
+
+	f, err := os.OpenFile(fileLocation, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("os.OpenFile: %w", err)
+	}
 
 	parsedUrl, err := url.Parse(playlistUrl)
 	if err != nil {
@@ -131,11 +142,6 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 		ForceQuery: parsedUrl.ForceQuery,
 		RawQuery:   parsedUrl.RawQuery,
 		Fragment:   parsedUrl.Fragment,
-	}
-
-	f, err := os.OpenFile(fileLocation, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		return nil, fmt.Errorf("os.OpenFile: %w", err)
 	}
 
 	result := &StreamHLSTask{
