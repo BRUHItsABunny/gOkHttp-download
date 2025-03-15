@@ -58,7 +58,7 @@ func NewGlobalDownloadTracker(idleTimeout time.Duration) *GlobalDownloadTracker 
 }
 
 func GetCurrentIPAddress(hClient *http.Client) (ip string) {
-	req, err := gokhttp_requests.MakeGETRequest(context.Background(), "https://httpbin.org/get")
+	req, err := gokhttp_requests.MakeGETRequest(context.Background(), "https://speed.cloudflare.com/meta")
 	if err != nil {
 		return
 	}
@@ -72,7 +72,7 @@ func GetCurrentIPAddress(hClient *http.Client) (ip string) {
 	if err != nil {
 		return
 	}
-	ipPreCast, ok := data["origin"]
+	ipPreCast, ok := data["clientIp"]
 	if ok {
 		ip = ipPreCast.(string)
 	}
