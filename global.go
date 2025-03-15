@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/BRUHItsABunny/gOkHttp/requests"
 	"github.com/BRUHItsABunny/gOkHttp/responses"
+	"github.com/cornelk/hashmap"
 	"github.com/dustin/go-humanize"
 	"go.uber.org/atomic"
 	"net/http"
@@ -47,7 +48,7 @@ func NewGlobalDownloadTracker(idleTimeout time.Duration) *GlobalDownloadTracker 
 		LastTick:        NewCustomTime(time.Now()),
 		CurrentIP:       atomic.NewString(""),
 		TotalThreads:    atomic.NewUint64(0),
-		Tasks:           &TaskMap[string, DownloadTask]{},
+		Tasks:           &TaskMap[string, DownloadTask]{Map: hashmap.New[string, DownloadTask]()},
 		TotalFiles:      atomic.NewUint64(0),
 		TotalBytes:      atomic.NewUint64(0),
 		DownloadedFiles: atomic.NewUint64(0),
@@ -57,7 +58,7 @@ func NewGlobalDownloadTracker(idleTimeout time.Duration) *GlobalDownloadTracker 
 }
 
 func GetCurrentIPAddress(hClient *http.Client) (ip string) {
-	req, err := gokhttp_requests.MakeGETRequest(context.Background(), "https://httpbin.org/get")
+	req, err := gokhttp_requests.MakeGETRequest(context.Background(), "https://speed.cloudflare.com/meta")
 	if err != nil {
 		return
 	}
@@ -71,7 +72,7 @@ func GetCurrentIPAddress(hClient *http.Client) (ip string) {
 	if err != nil {
 		return
 	}
-	ipPreCast, ok := data["origin"]
+	ipPreCast, ok := data["clientIp"]
 	if ok {
 		ip = ipPreCast.(string)
 	}

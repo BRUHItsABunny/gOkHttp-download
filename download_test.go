@@ -149,6 +149,15 @@ func TestStreamHLSTask_Download(t *testing.T) {
 	}
 }
 
+func TestGetCurrentIPAddress(t *testing.T) {
+	initTestEnv()
+	hClient, err := initHClient()
+	if err != nil {
+		t.Error(err)
+	}
+	fmt.Println(GetCurrentIPAddress(hClient))
+}
+
 func TestStreamMuxer(t *testing.T) {
 	// TODO: Collect segments and a glitching final muxed result.
 }
