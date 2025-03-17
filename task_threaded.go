@@ -228,7 +228,7 @@ func NewThreadedDownloadTask(ctx context.Context, hClient *http.Client, global *
 	}
 
 	// Is the dir accessible and is the file already downloaded and complete
-	err := os.MkdirAll(filepath.Dir(result.FileLocation.Load()), 0600)
+	err := os.MkdirAll(filepath.Dir(fileLocation), 0600)
 	if err != nil {
 		return nil, fmt.Errorf("os.MkdirAll: %w", err)
 	}

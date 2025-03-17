@@ -114,7 +114,7 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 		fileLocation += ".ts"
 	}
 	fileName := filepath.Base(fileLocation)
-	fileDir := filepath.Dir(fileName)
+	fileDir := filepath.Dir(fileLocation)
 
 	err := os.MkdirAll(fileDir, os.ModePerm)
 	if err != nil {
