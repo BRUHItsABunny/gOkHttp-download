@@ -4,15 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/BRUHItsABunny/gOkHttp/requests"
 	"github.com/BRUHItsABunny/gOkHttp/responses"
 	"github.com/cornelk/hashmap"
 	"github.com/dustin/go-humanize"
 	"go.uber.org/atomic"
-	"net/http"
-	"strings"
-	"sync"
-	"time"
 )
 
 type GlobalDownloadTracker struct {
@@ -58,7 +59,7 @@ func NewGlobalDownloadTracker(idleTimeout time.Duration) *GlobalDownloadTracker 
 }
 
 func GetCurrentIPAddress(hClient *http.Client) (ip string) {
-	req, err := gokhttp_requests.MakeGETRequest(context.Background(), "https://speed.cloudflare.com/meta")
+	req, err := gokhttp_requests.MakeGETRequest(context.Background(), "https://api.bigdatacloud.net/data/client-ip")
 	if err != nil {
 		return
 	}
@@ -72,7 +73,7 @@ func GetCurrentIPAddress(hClient *http.Client) (ip string) {
 	if err != nil {
 		return
 	}
-	ipPreCast, ok := data["clientIp"]
+	ipPreCast, ok := data["ipString"]
 	if ok {
 		ip = ipPreCast.(string)
 	}

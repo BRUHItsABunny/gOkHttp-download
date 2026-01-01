@@ -4,11 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/BRUHItsABunny/gOkHttp/requests"
-	"github.com/cornelk/hashmap"
-	"github.com/dustin/go-humanize"
-	"go.uber.org/atomic"
-	"golang.org/x/sync/errgroup"
 	"io"
 	"math"
 	"net/http"
@@ -17,9 +12,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BRUHItsABunny/gOkHttp/requests"
+	"github.com/cornelk/hashmap"
+	"github.com/dustin/go-humanize"
+	"go.uber.org/atomic"
+	"golang.org/x/sync/errgroup"
 )
 
 type ThreadedChunk struct {
+	// Parent
+	Parent *ThreadedDownloadTask
 	// Metadata
 	ChunkID    *atomic.Uint64 `json:"chunkID"`
 	ChunkStart uint64         `json:"-"`
@@ -30,6 +33,17 @@ type ThreadedChunk struct {
 	// Download stats
 	DownloadedBytes *atomic.Uint64 `json:"downloadedBytes"`
 	DeltaBytes      *atomic.Uint64 `json:"deltaBytes"`
+}
+
+func (tc *ThreadedChunk) Write(p []byte) (int, error) {
+	written, err := tc.F.Write(p)
+	tc.DownloadedBytes.Add(uint64(written))
+	tc.DeltaBytes.Add(uint64(written))
+	tc.Parent.TaskStats.DownloadedBytes.Add(uint64(written))
+	tc.Parent.TaskStats.DeltaBytes.Add(uint64(written))
+	tc.Parent.Global.DownloadedBytes.Add(uint64(written))
+	tc.Parent.Global.DeltaBytes.Add(uint64(written))
+	return written, err
 }
 
 type ThreadedDownloadTask struct {
@@ -227,6 +241,8 @@ func NewThreadedDownloadTask(ctx context.Context, hClient *http.Client, global *
 		ChunkCount: atomic.NewUint64(1),
 	}
 
+	shouldCheckResumable := threads > 1 // Check it if we're chunking
+
 	// Is the dir accessible and is the file already downloaded and complete
 	err := os.MkdirAll(filepath.Dir(fileLocation), 0600)
 	if err != nil {
@@ -243,12 +259,17 @@ func NewThreadedDownloadTask(ctx context.Context, hClient *http.Client, global *
 	result.TaskStats.DownloadedBytes.Store(uint64(stats.Size()))
 	if stats.Size() > 0 {
 		threads = 1
+		shouldCheckResumable = true // Check it iif we are resuming
 	}
-
+	if uint64(stats.Size()) == expectedSize {
+		shouldCheckResumable = false // Don't check when done, faster + less spam for server
+	}
 	result.TaskStats.FileSize.Store(expectedSize)
-	err = result.isResumable(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("isResumable:%w", err)
+	if shouldCheckResumable {
+		err = result.isResumable(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("isResumable:%w", err)
+		}
 	}
 
 	result.ChunkCount.Store(threads)
@@ -256,6 +277,7 @@ func NewThreadedDownloadTask(ctx context.Context, hClient *http.Client, global *
 	for i := uint64(1); i <= threads; i++ {
 		chunkKey := strconv.FormatUint(i, 10)
 		chunk := &ThreadedChunk{
+			Parent:          result,
 			ChunkID:         atomic.NewUint64(i),
 			FileSize:        atomic.NewUint64(0),
 			DownloadedBytes: atomic.NewUint64(0),
@@ -328,28 +350,21 @@ func (tt *ThreadedDownloadTask) downloadChunk(ctx context.Context, chunk *Thread
 	}
 
 	// Thread safe downloading and tracking and graceful stop
-	var written int64
-	for {
-		written, err = io.CopyN(chunk.F, resp.Body, 1024)
-		// Store all
-		chunk.DownloadedBytes.Add(uint64(written))
-		chunk.DeltaBytes.Add(uint64(written))
-		tt.TaskStats.DownloadedBytes.Add(uint64(written))
-		tt.TaskStats.DeltaBytes.Add(uint64(written))
-		tt.Global.DownloadedBytes.Add(uint64(written))
-		tt.Global.DeltaBytes.Add(uint64(written))
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		for range ticker.C {
+			if tt.Global.GraceFulStop.Load() {
+				ticker.Stop()
+				_ = resp.Body.Close()
+				break
+			}
+		}
+	}()
 
-		shouldStop := tt.Global.GraceFulStop.Load()
-		if chunk.DownloadedBytes.Load() >= chunk.FileSize.Load() || shouldStop {
-			err = nil
-			_ = resp.Body.Close()
-			// _ = chunk.F.Close()
-			break
-		}
-		if err != nil {
-			err = fmt.Errorf("[%s:%d] io.CopyN: %w", tt.FileName.String(), chunk.ChunkID.Load(), err)
-			break
-		}
+	_, err = io.Copy(chunk, resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		err = fmt.Errorf("[%s:%d] io.Copy: %w", tt.FileName.String(), chunk.ChunkID.Load(), err)
 	}
 
 	tt.Global.TotalThreads.Dec()
