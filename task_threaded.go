@@ -22,7 +22,7 @@ import (
 
 type ThreadedChunk struct {
 	// Parent
-	Parent *ThreadedDownloadTask
+	Parent *ThreadedDownloadTask `json:"-"`
 	// Metadata
 	ChunkID    *atomic.Uint64 `json:"chunkID"`
 	ChunkStart uint64         `json:"-"`
