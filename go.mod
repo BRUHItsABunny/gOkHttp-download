@@ -9,12 +9,12 @@ require (
 	github.com/dustin/go-humanize v1.0.1
 	github.com/etherlabsio/go-m3u8 v1.0.0
 	github.com/joho/godotenv v1.5.1
-	github.com/yapingcat/gomedia v0.0.0-20240906162731-17feea57090c
 	go.uber.org/atomic v1.11.0
 	golang.org/x/sync v0.1.0
 )
 
 require (
+	github.com/BRUHItsABunny/gomedia v0.0.0-20260411233747-44fcbeddf130 // indirect
 	github.com/OneOfOne/xxhash v1.2.8 // indirect
 	golang.org/x/net v0.23.0 // indirect
 	golang.org/x/text v0.14.0 // indirect

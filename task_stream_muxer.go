@@ -3,8 +3,11 @@ package gokhttp_download
 import (
 	"bytes"
 	"fmt"
-	"github.com/yapingcat/gomedia/go-mpeg2"
+	"sync"
+
 	"os"
+
+	"github.com/BRUHItsABunny/gomedia/go-mpeg2"
 )
 
 type StreamMuxer struct {
@@ -12,6 +15,7 @@ type StreamMuxer struct {
 	Muxer   *mpeg2.TSMuxer
 	Demuxer *mpeg2.TSDemuxer
 	Streams map[mpeg2.TS_STREAM_TYPE]uint16
+	mu      sync.Mutex
 }
 
 func NewStreamMuxer(f *os.File) *StreamMuxer {
@@ -119,4 +123,12 @@ func (m *StreamMuxer) Demux(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts uint64, 
 	if err != nil {
 		panic(fmt.Errorf("result.Muxer.Write: %w", err))
 	}
+}
+
+// InputSafe feeds a buffer to the demuxer with mutex protection for concurrent
+// audio+video access.
+func (m *StreamMuxer) InputSafe(buf *bytes.Buffer) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.Demuxer.Input(buf)
 }
