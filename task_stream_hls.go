@@ -367,11 +367,9 @@ func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
 }
 
 func buildURLFromBase(baseUrl *url.URL, path string) string {
-	if strings.HasPrefix(path, "http") {
+	ref, err := url.Parse(path)
+	if err != nil {
 		return path
 	}
-
-	baseUrlClone, _ := url.Parse(baseUrl.String())
-	baseUrlClone.Path += "/" + path
-	return baseUrlClone.String()
+	return baseUrl.ResolveReference(ref).String()
 }
