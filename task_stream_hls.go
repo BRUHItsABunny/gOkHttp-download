@@ -244,19 +244,19 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 		case <-ticker:
 			req, err = gokhttp_requests.MakeGETRequest(ctx, playlistUrl, st.Opts...)
 			if err != nil {
-				return fmt.Errorf("[targetStream] requests.MakeGETRequest: %w", err)
+				continue
 			}
 			resp, err = st.HClient.Do(req)
 			if err != nil {
-				return fmt.Errorf("[targetStream] hClient.Do: %w", err)
+				continue
 			}
 			respText, err = gokhttp_responses.ResponseText(resp)
 			if err != nil {
-				return fmt.Errorf("[targetStream] responses.ResponseBytes: %w", err)
+				continue
 			}
 			playList, err = m3u8.ReadString(respText)
 			if err != nil {
-				return fmt.Errorf("[targetStream] m3u8.ReadString: %w", err)
+				continue
 			}
 
 			for _, chunk := range playList.Segments() {
@@ -266,14 +266,14 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 
 				_, ok := st.SegmentCache.Get(chunk.Segment)
 				if !ok {
-					st.SegmentCache.Set(chunk.Segment, time.Now())
 					st.SegmentChan <- chunk
-
 				}
 			}
-			// Detect end or just stop after duration of not getting new chunks
 
-			break
+			// Stream ended: playlist has EXT-X-ENDLIST tag
+			if !playList.IsLive() {
+				break
+			}
 		}
 
 		if st.Global.GraceFulStop.Load() {
@@ -324,16 +324,18 @@ func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
 		case newChunk := <-st.SegmentChan:
 			req, err := gokhttp_requests.MakeGETRequest(ctx, buildURLFromBase(st.BaseUrl, newChunk.Segment), st.Opts...)
 			if err != nil {
-				return fmt.Errorf("requests.MakeGETRequest: %w", err)
+				continue
 			}
 			resp, err := st.HClient.Do(req)
 			if err != nil {
-				return fmt.Errorf("st.HClient.Do: %w", err)
+				continue
 			}
 			respBytes, err := gokhttp_responses.ResponseBytes(resp)
 			if err != nil {
-				return fmt.Errorf("responses.ResponseBytes: %w", err)
+				continue
 			}
+
+			st.SegmentCache.Set(newChunk.Segment, time.Now())
 
 			buf := bytes.NewBuffer(respBytes)
 
