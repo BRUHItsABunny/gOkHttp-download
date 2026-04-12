@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,108 @@ import (
 	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
 )
+
+// HLSVariant represents a video variant stream from the master playlist,
+// sorted by bandwidth descending (index 0 = highest quality).
+type HLSVariant struct {
+	Bandwidth        int
+	AverageBandwidth *int
+	Resolution       *m3u8.Resolution
+	Codecs           *string
+	Name             *string
+	FrameRate        *float64
+	PlaylistItem     *m3u8.PlaylistItem
+}
+
+// HLSAudioRendition represents an audio rendition from the master playlist,
+// associated with a specific video variant's audio group.
+type HLSAudioRendition struct {
+	GroupID   string
+	Name      string
+	Language  *string
+	Channels  *string
+	URI       *string
+	MediaItem *m3u8.MediaItem
+}
+
+// HLSStreamSelector configures which video and audio stream indices to download.
+// Index 0 is the highest quality (sorted by bandwidth descending).
+type HLSStreamSelector struct {
+	VideoIndex int // index into sorted video variants (default 0 = highest)
+	AudioIndex int // index into sorted audio renditions (default 0 = first match)
+}
+
+// SortHLSStreams fetches and parses the master playlist, returning video variants
+// sorted by bandwidth descending and audio renditions for the selected video variant.
+// This allows callers to inspect available qualities before starting a download.
+func SortHLSStreams(ctx context.Context, hClient *http.Client, playlistUrl string, opts ...gokhttp_requests.Option) ([]HLSVariant, []HLSAudioRendition, error) {
+	req, err := gokhttp_requests.MakeGETRequest(ctx, playlistUrl, opts...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("requests.MakeGETRequest: %w", err)
+	}
+	resp, err := hClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("hClient.Do: %w", err)
+	}
+	respText, err := gokhttp_responses.ResponseText(resp)
+	if err != nil {
+		return nil, nil, fmt.Errorf("responses.ResponseText: %w", err)
+	}
+	playList, err := m3u8.ReadString(respText)
+	if err != nil {
+		return nil, nil, fmt.Errorf("m3u8.ReadString: %w", err)
+	}
+	if !playList.IsMaster() {
+		return nil, nil, errors.New("playlist is not a master playlist")
+	}
+
+	return sortHLSPlaylist(playList)
+}
+
+// sortHLSPlaylist extracts and sorts video variants and audio renditions from a parsed master playlist.
+func sortHLSPlaylist(playList *m3u8.Playlist) ([]HLSVariant, []HLSAudioRendition, error) {
+	playlists := playList.Playlists()
+	if len(playlists) == 0 {
+		return nil, nil, errors.New("no variant streams found in master playlist")
+	}
+
+	// Sort video variants by bandwidth descending
+	sort.Slice(playlists, func(i, j int) bool {
+		return playlists[i].Bandwidth > playlists[j].Bandwidth
+	})
+
+	variants := make([]HLSVariant, len(playlists))
+	for i, pl := range playlists {
+		variants[i] = HLSVariant{
+			Bandwidth:        pl.Bandwidth,
+			AverageBandwidth: pl.AverageBandwidth,
+			Resolution:       pl.Resolution,
+			Codecs:           pl.Codecs,
+			Name:             pl.Name,
+			FrameRate:        pl.FrameRate,
+			PlaylistItem:     pl,
+		}
+	}
+
+	// Collect all audio renditions
+	var audioRenditions []HLSAudioRendition
+	for _, item := range playList.Items {
+		if mediaItem, ok := item.(*m3u8.MediaItem); ok {
+			if mediaItem.Type == "AUDIO" && mediaItem.URI != nil {
+				audioRenditions = append(audioRenditions, HLSAudioRendition{
+					GroupID:   mediaItem.GroupID,
+					Name:      mediaItem.Name,
+					Language:  mediaItem.Language,
+					Channels:  mediaItem.Channels,
+					URI:       mediaItem.URI,
+					MediaItem: mediaItem,
+				})
+			}
+		}
+	}
+
+	return variants, audioRenditions, nil
+}
 
 // SequencedSegment wraps a segment item with its media sequence number.
 type SequencedSegment struct {
@@ -75,6 +178,9 @@ type StreamHLSTask struct {
 	Format     StreamFormat `json:"format"`
 	outputFile *os.File
 	initDone   chan struct{} // closed after getSegments finishes initialization
+
+	// Stream selection
+	StreamSelector *HLSStreamSelector `json:"-"`
 
 	// Audio stream support
 	HasAudioStream    bool                            `json:"-"`
@@ -301,18 +407,6 @@ func findMapItem(playList *m3u8.Playlist) *m3u8.MapItem {
 	return nil
 }
 
-// findAudioMediaItem finds the audio MediaItem matching the given group ID.
-func findAudioMediaItem(playList *m3u8.Playlist, groupID string) *m3u8.MediaItem {
-	for _, item := range playList.Items {
-		if mediaItem, ok := item.(*m3u8.MediaItem); ok {
-			if mediaItem.Type == "AUDIO" && mediaItem.GroupID == groupID && mediaItem.URI != nil {
-				return mediaItem
-			}
-		}
-	}
-	return nil
-}
-
 func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 	var initClosed bool
 	defer func() {
@@ -354,22 +448,43 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 			break
 		}
 
-		// Select highest bandwidth variant
-		targetChunkStream := &m3u8.PlaylistItem{Bandwidth: 0}
-		for _, chunkStream := range playList.Playlists() {
-			if targetChunkStream.Bandwidth < chunkStream.Bandwidth {
-				targetChunkStream = chunkStream
-			}
+		// Sort variants and select by index
+		variants, audioRenditions, sortErr := sortHLSPlaylist(playList)
+		if sortErr != nil {
+			return fmt.Errorf("sortHLSPlaylist: %w", sortErr)
 		}
 
+		videoIdx := 0
+		audioIdx := 0
+		if st.StreamSelector != nil {
+			videoIdx = st.StreamSelector.VideoIndex
+			audioIdx = st.StreamSelector.AudioIndex
+		}
+		if videoIdx < 0 || videoIdx >= len(variants) {
+			return fmt.Errorf("video index %d out of range (0-%d)", videoIdx, len(variants)-1)
+		}
+
+		targetChunkStream := variants[videoIdx].PlaylistItem
 		if targetChunkStream.Bandwidth == 0 {
 			return errors.New("stream can't have 0 bandwidth")
 		}
 
-		// Discover separate audio stream
+		// Discover separate audio stream using the selected variant's audio group
 		if targetChunkStream.Audio != nil {
-			audioMedia := findAudioMediaItem(playList, *targetChunkStream.Audio)
-			if audioMedia != nil {
+			// Filter audio renditions matching this variant's audio group
+			var matchingAudio []HLSAudioRendition
+			for _, ar := range audioRenditions {
+				if ar.GroupID == *targetChunkStream.Audio {
+					matchingAudio = append(matchingAudio, ar)
+				}
+			}
+
+			if len(matchingAudio) > 0 {
+				if audioIdx < 0 || audioIdx >= len(matchingAudio) {
+					return fmt.Errorf("audio index %d out of range (0-%d)", audioIdx, len(matchingAudio)-1)
+				}
+
+				audioMedia := matchingAudio[audioIdx].MediaItem
 				st.HasAudioStream = true
 				audioURL := buildURLFromBase(st.BaseUrl, *audioMedia.URI)
 				st.AudioPlaylistUrl = atomic.NewString(audioURL)
