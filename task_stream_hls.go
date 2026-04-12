@@ -22,6 +22,18 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// SequencedSegment wraps a segment item with its media sequence number.
+type SequencedSegment struct {
+	MSN     int
+	Segment *m3u8.SegmentItem
+}
+
+// SequencedBuffer wraps downloaded segment data with its media sequence number.
+type SequencedBuffer struct {
+	MSN  int
+	Data []byte
+}
+
 type StreamFormat int
 
 const (
@@ -42,9 +54,9 @@ type StreamHLSTask struct {
 	ReqOpts []gokhttp_requests.Option `json:"-"`
 
 	// Muxers (only one is used, based on Format)
-	Muxer     *StreamMuxer     `json:"-"`
-	FMP4Muxer *StreamFMP4Muxer `json:"-"`
-	TaskStats *StreamStats     `json:"taskStats"`
+	Muxer       *StreamMuxer `json:"-"`
+	FMP4Demuxer *FMP4Demuxer `json:"-"`
+	TaskStats   *StreamStats `json:"taskStats"`
 
 	TaskType     DownloadType                    `json:"taskType"`
 	TaskVersion  DownloadVersion                 `json:"taskVersion"`
@@ -53,8 +65,8 @@ type StreamHLSTask struct {
 	PlayListUrl  *atomic.String                  `json:"playListUrl"`
 	BaseUrl      *url.URL                        `json:"-"`
 	Opts         []gokhttp_requests.Option       `json:"-"`
-	SegmentChan  chan *m3u8.SegmentItem          `json:"-"`
-	BufferChan   chan *bytes.Buffer              `json:"-"`
+	SegmentChan  chan SequencedSegment           `json:"-"`
+	BufferChan   chan SequencedBuffer            `json:"-"`
 	SegmentCache *hashmap.Map[string, time.Time] `json:"-"`
 	SaveSegments bool                            `json:"-"`
 
@@ -67,13 +79,24 @@ type StreamHLSTask struct {
 	HasAudioStream    bool                            `json:"-"`
 	AudioPlaylistUrl  *atomic.String                  `json:"-"`
 	AudioBaseUrl      *url.URL                        `json:"-"`
-	AudioSegmentChan  chan *m3u8.SegmentItem          `json:"-"`
-	AudioBufferChan   chan *bytes.Buffer              `json:"-"`
+	AudioSegmentChan  chan SequencedSegment           `json:"-"`
+	AudioBufferChan   chan SequencedBuffer            `json:"-"`
 	AudioSegmentCache *hashmap.Map[string, time.Time] `json:"-"`
 	audioWg           sync.WaitGroup
 }
 
 func (st *StreamHLSTask) Download(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Cancel context when GraceFulStop is set so HTTP requests and selects unblock
+	go func() {
+		for !st.Global.GraceFulStop.Load() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		cancel()
+	}()
+
 	errGr, ctx := errgroup.WithContext(ctx)
 	errGr.Go(func() error {
 		err := st.getSegments(ctx)
@@ -90,14 +113,14 @@ func (st *StreamHLSTask) Download(ctx context.Context) error {
 		return nil
 	})
 	errGr.Go(func() error {
-		err := st.mergeSegments()
+		err := st.mergeSegments(ctx)
 		if err != nil {
 			return fmt.Errorf("st.mergeSegments: %w", err)
 		}
 		return nil
 	})
 	errGr.Go(func() error {
-		st.cleanUp()
+		st.cleanUp(ctx)
 		return nil
 	})
 
@@ -116,12 +139,7 @@ func (st *StreamHLSTask) Download(ctx context.Context) error {
 	st.Global.Done()
 	st.Global.TotalThreads.Dec()
 
-	// Close muxer and file
-	if st.FMP4Muxer != nil {
-		if closeErr := st.FMP4Muxer.Close(); closeErr != nil {
-			err = fmt.Errorf("st.FMP4Muxer.Close: %w", closeErr)
-		}
-	}
+	// Close output file
 	if st.outputFile != nil {
 		if closeErr := st.outputFile.Close(); closeErr != nil && err == nil {
 			err = fmt.Errorf("outputFile.Close: %w", closeErr)
@@ -191,8 +209,8 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 		},
 		FileName:     atomic.NewString(filepath.Base(fileLocation)),
 		FileLocation: atomic.NewString(fileLocation),
-		SegmentChan:  make(chan *m3u8.SegmentItem),
-		BufferChan:   make(chan *bytes.Buffer),
+		SegmentChan:  make(chan SequencedSegment),
+		BufferChan:   make(chan SequencedBuffer),
 		PlayListUrl:  atomic.NewString(playlistUrl),
 		BaseUrl:      baseUrl,
 		Opts:         opts,
@@ -204,13 +222,12 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 	return result, nil
 }
 
-func (st *StreamHLSTask) cleanUp() {
-	ticker := time.Tick(time.Second)
+func (st *StreamHLSTask) cleanUp(ctx context.Context) {
 	tickerClean := time.Tick(time.Minute)
 	for {
 		select {
-		case <-ticker:
-			break
+		case <-ctx.Done():
+			return
 		case <-tickerClean:
 			st.SegmentCache.Range(func(key string, val time.Time) bool {
 				if time.Minute < time.Now().Sub(val) {
@@ -226,11 +243,6 @@ func (st *StreamHLSTask) cleanUp() {
 					return true
 				})
 			}
-			break
-		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
 		}
 	}
 }
@@ -240,32 +252,20 @@ func (st *StreamHLSTask) initOutputFile() error {
 	fileLocation := st.FileLocation.Load()
 	var err error
 
+	// Always output .ts regardless of source format
+	fileLocation += ".ts"
+	st.FileLocation.Store(fileLocation)
+	st.FileName.Store(filepath.Base(fileLocation))
+
+	f, err := os.OpenFile(fileLocation, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		return fmt.Errorf("os.OpenFile: %w", err)
+	}
+	st.outputFile = f
+	st.Muxer = NewStreamMuxer(f)
+
 	if st.Format == StreamFormatFMP4 {
-		fileLocation += ".mp4"
-		st.FileLocation.Store(fileLocation)
-		st.FileName.Store(filepath.Base(fileLocation))
-
-		f, err := os.OpenFile(fileLocation, os.O_CREATE|os.O_RDWR, 0666)
-		if err != nil {
-			return fmt.Errorf("os.OpenFile: %w", err)
-		}
-		st.outputFile = f
-
-		st.FMP4Muxer, err = NewStreamFMP4Muxer(f)
-		if err != nil {
-			return fmt.Errorf("NewStreamFMP4Muxer: %w", err)
-		}
-	} else {
-		fileLocation += ".ts"
-		st.FileLocation.Store(fileLocation)
-		st.FileName.Store(filepath.Base(fileLocation))
-
-		f, err := os.OpenFile(fileLocation, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil {
-			return fmt.Errorf("os.OpenFile: %w", err)
-		}
-		st.outputFile = f
-		st.Muxer = NewStreamMuxer(f)
+		st.FMP4Demuxer = NewFMP4Demuxer(st.Muxer)
 	}
 
 	return err
@@ -312,6 +312,13 @@ func findAudioMediaItem(playList *m3u8.Playlist, groupID string) *m3u8.MediaItem
 }
 
 func (st *StreamHLSTask) getSegments(ctx context.Context) error {
+	var initClosed bool
+	defer func() {
+		if !initClosed {
+			close(st.initDone)
+		}
+	}()
+
 	var (
 		req      *http.Request
 		resp     *http.Response
@@ -382,8 +389,8 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 					}
 				}
 
-				st.AudioSegmentChan = make(chan *m3u8.SegmentItem)
-				st.AudioBufferChan = make(chan *bytes.Buffer)
+				st.AudioSegmentChan = make(chan SequencedSegment)
+				st.AudioBufferChan = make(chan SequencedBuffer)
 				st.AudioSegmentCache = hashmap.New[string, time.Time]()
 			}
 		}
@@ -428,7 +435,7 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 		if dlErr != nil {
 			return fmt.Errorf("downloadInitSegment (video): %w", dlErr)
 		}
-		st.FMP4Muxer.SetInitSegment(initData)
+		st.FMP4Demuxer.SetInitSegment(initData)
 
 		if st.SaveSegments {
 			saveDir := filepath.Dir(st.FileLocation.Load())
@@ -461,7 +468,7 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 				if audioInitErr != nil {
 					return fmt.Errorf("downloadInitSegment (audio): %w", audioInitErr)
 				}
-				st.FMP4Muxer.SetAudioInitSegment(audioInitData)
+				st.FMP4Demuxer.SetAudioInitSegment(audioInitData)
 
 				if st.SaveSegments {
 					saveDir := filepath.Dir(st.FileLocation.Load())
@@ -482,11 +489,14 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 
 	// Signal that initialization is complete
 	close(st.initDone)
+	initClosed = true
 
 	// Video segment polling loop
 	ticker := time.Tick(time.Second)
 	for {
 		select {
+		case <-ctx.Done():
+			return nil
 		case <-ticker:
 			req, err = gokhttp_requests.MakeGETRequest(ctx, playlistUrl, st.Opts...)
 			if err != nil {
@@ -505,14 +515,15 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 				continue
 			}
 
-			for _, chunk := range playList.Segments() {
+			for i, chunk := range playList.Segments() {
 				if st.Global.GraceFulStop.Load() {
 					break
 				}
 
 				_, ok := st.SegmentCache.Get(chunk.Segment)
 				if !ok {
-					if !trySend(st.SegmentChan, chunk, st.Global.GraceFulStop) {
+					seq := SequencedSegment{MSN: playList.Sequence + i, Segment: chunk}
+					if !trySend(st.SegmentChan, seq, st.Global.GraceFulStop) {
 						break
 					}
 				}
@@ -520,16 +531,10 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 
 			// Stream ended: playlist has EXT-X-ENDLIST tag
 			if !playList.IsLive() {
-				break
+				return nil
 			}
 		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
-		}
 	}
-
-	return nil
 }
 
 func (st *StreamHLSTask) getAudioSegments(ctx context.Context) {
@@ -537,6 +542,8 @@ func (st *StreamHLSTask) getAudioSegments(ctx context.Context) {
 	ticker := time.Tick(time.Second)
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-ticker:
 			req, err := gokhttp_requests.MakeGETRequest(ctx, playlistUrl, st.Opts...)
 			if err != nil {
@@ -555,14 +562,15 @@ func (st *StreamHLSTask) getAudioSegments(ctx context.Context) {
 				continue
 			}
 
-			for _, chunk := range playList.Segments() {
+			for i, chunk := range playList.Segments() {
 				if st.Global.GraceFulStop.Load() {
 					break
 				}
 
 				_, ok := st.AudioSegmentCache.Get(chunk.Segment)
 				if !ok {
-					if !trySend(st.AudioSegmentChan, chunk, st.Global.GraceFulStop) {
+					seq := SequencedSegment{MSN: playList.Sequence + i, Segment: chunk}
+					if !trySend(st.AudioSegmentChan, seq, st.Global.GraceFulStop) {
 						break
 					}
 				}
@@ -572,140 +580,138 @@ func (st *StreamHLSTask) getAudioSegments(ctx context.Context) {
 				break
 			}
 		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
-		}
 	}
 }
 
-func (st *StreamHLSTask) mergeSegments() error {
-	<-st.initDone
+func (st *StreamHLSTask) mergeSegments(ctx context.Context) error {
+	select {
+	case <-st.initDone:
+	case <-ctx.Done():
+		return nil
+	}
 	if st.Format == StreamFormatFMP4 {
-		return st.mergeFMP4Segments()
+		return st.mergeFMP4Segments(ctx)
 	}
-	return st.mergeTSSegments()
+	return st.mergeTSSegments(ctx)
 }
 
-func (st *StreamHLSTask) mergeTSSegments() error {
+func (st *StreamHLSTask) mergeTSSegments(ctx context.Context) error {
 	if st.HasAudioStream {
 		st.audioWg.Add(1)
 		go func() {
 			defer st.audioWg.Done()
-			st.mergeTSAudioSegments()
+			st.mergeTSAudioSegments(ctx)
 		}()
 	}
 
 	isFirst := true
-	ticker := time.Tick(time.Second)
 	for {
 		select {
-		case <-ticker:
-			break
+		case <-ctx.Done():
+			return nil
 		case newBuffer := <-st.BufferChan:
+			buf := bytes.NewBuffer(newBuffer.Data)
 			if isFirst {
-				err := st.Muxer.AddStreams(newBuffer)
+				err := st.Muxer.AddStreams(buf)
 				if err != nil {
 					return fmt.Errorf("controller.Muxer.AddStreams: %w", err)
 				}
 				isFirst = false
 			}
-			err := st.Muxer.Demuxer.Input(newBuffer)
+			err := st.Muxer.Demuxer.Input(buf)
 			if err != nil {
 				return fmt.Errorf("controller.Muxer.Demuxer.Input: %w", err)
 			}
 			break
 		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
-		}
 	}
 
 	return nil
 }
 
-func (st *StreamHLSTask) mergeTSAudioSegments() {
-	ticker := time.Tick(time.Second)
+func (st *StreamHLSTask) mergeTSAudioSegments(ctx context.Context) {
 	for {
 		select {
-		case <-ticker:
-			break
+		case <-ctx.Done():
+			return
 		case newBuffer := <-st.AudioBufferChan:
-			st.Muxer.InputSafe(newBuffer)
-			break
-		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
+			st.Muxer.InputSafe(bytes.NewBuffer(newBuffer.Data))
 		}
 	}
 }
 
-func (st *StreamHLSTask) mergeFMP4Segments() error {
+func (st *StreamHLSTask) mergeFMP4Segments(ctx context.Context) error {
 	if !st.HasAudioStream {
-		// Video only: simple path
-		ticker := time.Tick(time.Second)
 		for {
 			select {
-			case <-ticker:
-				break
+			case <-ctx.Done():
+				return nil
 			case newBuffer := <-st.BufferChan:
-				err := st.FMP4Muxer.ProcessSegment(newBuffer.Bytes())
+				err := st.FMP4Demuxer.ProcessSegment(newBuffer.Data)
 				if err != nil {
-					return fmt.Errorf("FMP4Muxer.ProcessSegment: %w", err)
+					return fmt.Errorf("FMP4Demuxer.ProcessSegment: %w", err)
 				}
-				break
 			}
+		}
+	}
 
-			if st.Global.GraceFulStop.Load() {
+	// Collect audio+video by MSN and process in sequence order
+	nextMSN := -1
+	pendingVideo := map[int][]byte{}
+	pendingAudio := map[int][]byte{}
+
+	processPending := func() error {
+		for {
+			v, vOk := pendingVideo[nextMSN]
+			a, aOk := pendingAudio[nextMSN]
+			if !vOk || !aOk {
 				break
 			}
+			// Process audio first, then video for the same MSN
+			if err := st.FMP4Demuxer.ProcessAudioSegment(a); err != nil {
+				return fmt.Errorf("FMP4Demuxer.ProcessAudioSegment (MSN %d): %w", nextMSN, err)
+			}
+			if err := st.FMP4Demuxer.ProcessSegment(v); err != nil {
+				return fmt.Errorf("FMP4Demuxer.ProcessSegment (MSN %d): %w", nextMSN, err)
+			}
+			delete(pendingVideo, nextMSN)
+			delete(pendingAudio, nextMSN)
+			nextMSN++
 		}
 		return nil
 	}
 
-	// Audio + video: collect both, interleave by DTS before writing
-	ticker := time.Tick(time.Second)
-	var pendingVideo []byte
-	var pendingAudio []byte
 	for {
 		select {
-		case <-ticker:
-			break
+		case <-ctx.Done():
+			return nil
 		case newBuffer := <-st.BufferChan:
-			pendingVideo = newBuffer.Bytes()
+			if nextMSN == -1 {
+				nextMSN = newBuffer.MSN
+			}
+			pendingVideo[newBuffer.MSN] = newBuffer.Data
+			if err := processPending(); err != nil {
+				return err
+			}
 		case newBuffer := <-st.AudioBufferChan:
-			pendingAudio = newBuffer.Bytes()
-		}
-
-		// When we have both, interleave and write together
-		if pendingVideo != nil && pendingAudio != nil {
-			err := st.FMP4Muxer.ProcessAudioVideoSegments(pendingVideo, pendingAudio)
-			if err != nil {
-				return fmt.Errorf("FMP4Muxer.ProcessAudioVideoSegments: %w", err)
+			if nextMSN == -1 {
+				nextMSN = newBuffer.MSN
 			}
-			pendingVideo = nil
-			pendingAudio = nil
-		}
-
-		if st.Global.GraceFulStop.Load() {
-			// Flush any remaining pending segments
-			if pendingVideo != nil {
-				_ = st.FMP4Muxer.ProcessSegment(pendingVideo)
+			pendingAudio[newBuffer.MSN] = newBuffer.Data
+			if err := processPending(); err != nil {
+				return err
 			}
-			if pendingAudio != nil {
-				_ = st.FMP4Muxer.ProcessAudioSegment(pendingAudio)
-			}
-			break
 		}
 	}
-
-	return nil
 }
 
 func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
-	<-st.initDone
+	select {
+	case <-st.initDone:
+	case <-ctx.Done():
+		return nil
+	}
+
 	if st.HasAudioStream {
 		st.audioWg.Add(1)
 		go func() {
@@ -714,13 +720,13 @@ func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
 		}()
 	}
 
-	ticker := time.Tick(time.Second)
 	for {
 		select {
-		case <-ticker:
-			break
+		case <-ctx.Done():
+			return nil
 		case newChunk := <-st.SegmentChan:
-			req, err := gokhttp_requests.MakeGETRequest(ctx, buildURLFromBase(st.BaseUrl, newChunk.Segment), st.Opts...)
+			seg := newChunk.Segment
+			req, err := gokhttp_requests.MakeGETRequest(ctx, buildURLFromBase(st.BaseUrl, seg.Segment), st.Opts...)
 			if err != nil {
 				continue
 			}
@@ -733,22 +739,21 @@ func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
 				continue
 			}
 
-			st.SegmentCache.Set(newChunk.Segment, time.Now())
-
-			buf := bytes.NewBuffer(respBytes)
+			st.SegmentCache.Set(seg.Segment, time.Now())
 
 			st.TaskStats.DownloadedSegments.Inc()
-			st.TaskStats.DownloadedBytes.Add(uint64(buf.Len()))
-			st.TaskStats.DownloadedDuration.Add(int64(newChunk.Duration * 1500))
-			st.Global.TotalBytes.Add(uint64(buf.Len()))
-			st.Global.DownloadedBytes.Add(uint64(buf.Len()))
+			st.TaskStats.DownloadedBytes.Add(uint64(len(respBytes)))
+			st.TaskStats.DownloadedDuration.Add(int64(seg.Duration * 1500))
+			st.Global.TotalBytes.Add(uint64(len(respBytes)))
+			st.Global.DownloadedBytes.Add(uint64(len(respBytes)))
 
-			if !trySend(st.BufferChan, buf, st.Global.GraceFulStop) {
+			seqBuf := SequencedBuffer{MSN: newChunk.MSN, Data: respBytes}
+			if !trySend(st.BufferChan, seqBuf, st.Global.GraceFulStop) {
 				break
 			}
 			if st.SaveSegments {
 				fileLocation := filepath.Dir(st.FileLocation.Load())
-				f, err := os.OpenFile(filepath.Join(fileLocation, filepath.Base(newChunk.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
+				f, err := os.OpenFile(filepath.Join(fileLocation, filepath.Base(seg.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
 				if err != nil {
 					return fmt.Errorf("os.OpenFile: %w", err)
 				}
@@ -761,13 +766,7 @@ func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
 			}
 			break
 		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
-		}
 	}
-
-	return nil
 }
 
 func (st *StreamHLSTask) downloadAudioSegments(ctx context.Context) {
@@ -776,13 +775,13 @@ func (st *StreamHLSTask) downloadAudioSegments(ctx context.Context) {
 		baseUrl = st.BaseUrl
 	}
 
-	ticker := time.Tick(time.Second)
 	for {
 		select {
-		case <-ticker:
-			break
+		case <-ctx.Done():
+			return
 		case newChunk := <-st.AudioSegmentChan:
-			req, err := gokhttp_requests.MakeGETRequest(ctx, buildURLFromBase(baseUrl, newChunk.Segment), st.Opts...)
+			seg := newChunk.Segment
+			req, err := gokhttp_requests.MakeGETRequest(ctx, buildURLFromBase(baseUrl, seg.Segment), st.Opts...)
 			if err != nil {
 				continue
 			}
@@ -795,33 +794,27 @@ func (st *StreamHLSTask) downloadAudioSegments(ctx context.Context) {
 				continue
 			}
 
-			st.AudioSegmentCache.Set(newChunk.Segment, time.Now())
-
-			buf := bytes.NewBuffer(respBytes)
+			st.AudioSegmentCache.Set(seg.Segment, time.Now())
 
 			st.TaskStats.DownloadedSegments.Inc()
-			st.TaskStats.DownloadedBytes.Add(uint64(buf.Len()))
-			st.TaskStats.DownloadedDuration.Add(int64(newChunk.Duration * 1500))
-			st.Global.TotalBytes.Add(uint64(buf.Len()))
-			st.Global.DownloadedBytes.Add(uint64(buf.Len()))
+			st.TaskStats.DownloadedBytes.Add(uint64(len(respBytes)))
+			st.TaskStats.DownloadedDuration.Add(int64(seg.Duration * 1500))
+			st.Global.TotalBytes.Add(uint64(len(respBytes)))
+			st.Global.DownloadedBytes.Add(uint64(len(respBytes)))
 
-			if !trySend(st.AudioBufferChan, buf, st.Global.GraceFulStop) {
+			seqBuf := SequencedBuffer{MSN: newChunk.MSN, Data: respBytes}
+			if !trySend(st.AudioBufferChan, seqBuf, st.Global.GraceFulStop) {
 				break
 			}
 			if st.SaveSegments {
 				fileLocation := filepath.Dir(st.FileLocation.Load())
-				f, err := os.OpenFile(filepath.Join(fileLocation, "audio_"+filepath.Base(newChunk.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
+				f, err := os.OpenFile(filepath.Join(fileLocation, "audio_"+filepath.Base(seg.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
 				if err != nil {
 					continue
 				}
 				_, err = f.Write(respBytes)
 				f.Close()
 			}
-			break
-		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
 		}
 	}
 }

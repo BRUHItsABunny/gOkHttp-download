@@ -4,194 +4,155 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"sort"
 	"sync"
 
+	"github.com/BRUHItsABunny/gomedia/go-codec"
 	mp4 "github.com/BRUHItsABunny/gomedia/go-mp4"
+	mpeg2 "github.com/BRUHItsABunny/gomedia/go-mpeg2"
 )
 
-type fmp4TrackState struct {
-	trackMap    map[int]uint32 // demuxer trackId -> muxer trackId
-	initialized bool
-	firstDts    map[int]uint64
-	firstDtsSet map[int]bool
+// mp4CodecToTSStream maps MP4 codec types to MPEG-TS stream types.
+var mp4CodecToTSStream = map[mp4.MP4_CODEC_TYPE]mpeg2.TS_STREAM_TYPE{
+	mp4.MP4_CODEC_H264: mpeg2.TS_STREAM_H264,
+	mp4.MP4_CODEC_H265: mpeg2.TS_STREAM_H265,
+	mp4.MP4_CODEC_AAC:  mpeg2.TS_STREAM_AAC,
+	mp4.MP4_CODEC_MP2:  mpeg2.TS_STREAM_AUDIO_MPEG1,
+	mp4.MP4_CODEC_MP3:  mpeg2.TS_STREAM_AUDIO_MPEG2,
 }
 
-type StreamFMP4Muxer struct {
-	F                io.WriteSeeker
-	Muxer            *mp4.Movmuxer
+type fmp4TrackState struct {
+	initialized  bool
+	seenKeyframe bool // skip video frames until first IDR
+}
+
+// FMP4Demuxer demuxes fMP4/M4S segments and feeds frames to a StreamMuxer (TS output).
+type FMP4Demuxer struct {
+	Muxer            *StreamMuxer
 	InitSegment      []byte // video init segment (EXT-X-MAP)
 	AudioInitSegment []byte // audio init segment (separate EXT-X-MAP)
 	video            fmp4TrackState
 	audio            fmp4TrackState
-	mu               sync.Mutex
+	// Shared DTS base across audio and video for correct A/V sync
+	firstDts    uint64
+	firstDtsSet bool
+	mu          sync.Mutex
 }
 
-func newTrackState() fmp4TrackState {
-	return fmp4TrackState{
-		trackMap:    make(map[int]uint32),
-		firstDts:    make(map[int]uint64),
-		firstDtsSet: make(map[int]bool),
-	}
-}
-
-func NewStreamFMP4Muxer(f io.WriteSeeker) (*StreamFMP4Muxer, error) {
-	muxer, err := mp4.CreateMp4Muxer(f, mp4.WithMp4Flag(mp4.MP4_FLAG_FRAGMENT|mp4.MP4_FLAG_KEYFRAME))
-	if err != nil {
-		return nil, fmt.Errorf("mp4.CreateMp4Muxer: %w", err)
-	}
-
-	return &StreamFMP4Muxer{
-		F:     f,
+func NewFMP4Demuxer(muxer *StreamMuxer) *FMP4Demuxer {
+	return &FMP4Demuxer{
 		Muxer: muxer,
-		video: newTrackState(),
-		audio: newTrackState(),
-	}, nil
+	}
 }
 
-func (m *StreamFMP4Muxer) SetInitSegment(data []byte) {
-	m.InitSegment = data
+func (d *FMP4Demuxer) SetInitSegment(data []byte) {
+	d.InitSegment = data
 }
 
-func (m *StreamFMP4Muxer) SetAudioInitSegment(data []byte) {
-	m.AudioInitSegment = data
+func (d *FMP4Demuxer) SetAudioInitSegment(data []byte) {
+	d.AudioInitSegment = data
 }
 
-// demuxSegment extracts all packets from a segment using the given init data and track state.
-// It initializes muxer tracks on first call. Returns packets with normalized timestamps.
-func (m *StreamFMP4Muxer) demuxSegment(initData, segmentData []byte, state *fmp4TrackState) ([]*mp4.AVPacket, error) {
+// ensureStreams registers any new codec types from the demuxed track info with the TS muxer.
+func (d *FMP4Demuxer) ensureStreams(infos []mp4.TrackInfo) {
+	for _, info := range infos {
+		tsType, ok := mp4CodecToTSStream[info.Cid]
+		if !ok {
+			continue
+		}
+		if _, exists := d.Muxer.Streams[tsType]; !exists {
+			streamId := d.Muxer.Muxer.AddStream(tsType)
+			d.Muxer.Streams[tsType] = streamId
+		}
+	}
+}
+
+// processSegment demuxes an fMP4 segment and writes frames to the TS muxer.
+func (d *FMP4Demuxer) processSegment(initData, segmentData []byte, state *fmp4TrackState) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	initReader := bytes.NewReader(initData)
 	segReader := bytes.NewReader(segmentData)
 
 	concat, err := mp4.NewConcatReadSeeker([]io.ReadSeeker{initReader, segReader})
 	if err != nil {
-		return nil, fmt.Errorf("mp4.NewConcatReadSeeker: %w", err)
+		return fmt.Errorf("mp4.NewConcatReadSeeker: %w", err)
 	}
 
 	demuxer := mp4.CreateMp4Demuxer(concat)
 	infos, err := demuxer.ReadHead()
 	if err != nil {
-		return nil, fmt.Errorf("demuxer.ReadHead: %w", err)
+		return fmt.Errorf("demuxer.ReadHead: %w", err)
 	}
 
 	if !state.initialized {
-		for _, info := range infos {
-			var muxTrackId uint32
-			if info.Cid == mp4.MP4_CODEC_H264 || info.Cid == mp4.MP4_CODEC_H265 {
-				muxTrackId = m.Muxer.AddVideoTrack(info.Cid,
-					mp4.WithVideoWidth(info.Width),
-					mp4.WithVideoHeight(info.Height),
-				)
-			} else {
-				muxTrackId = m.Muxer.AddAudioTrack(info.Cid,
-					mp4.WithAudioChannelCount(info.ChannelCount),
-					mp4.WithAudioSampleRate(info.SampleRate),
-					mp4.WithAudioSampleBits(uint8(info.SampleSize)),
-				)
-			}
-			state.trackMap[info.TrackId] = muxTrackId
-		}
+		d.ensureStreams(infos)
 		state.initialized = true
 	}
 
-	var packets []*mp4.AVPacket
 	for {
 		pkt, err := demuxer.ReadPacket()
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
-			return nil, fmt.Errorf("demuxer.ReadPacket: %w", err)
+			return fmt.Errorf("demuxer.ReadPacket: %w", err)
 		}
-		muxTrackId, ok := state.trackMap[pkt.TrackId]
+
+		// Find the TS stream type for this codec
+		tsType, ok := mp4CodecToTSStream[pkt.Cid]
+		if !ok {
+			continue
+		}
+		streamId, ok := d.Muxer.Streams[tsType]
 		if !ok {
 			continue
 		}
 
-		// Normalize timestamps so output starts at 0
-		if !state.firstDtsSet[pkt.TrackId] {
-			state.firstDts[pkt.TrackId] = pkt.Dts
-			state.firstDtsSet[pkt.TrackId] = true
+		// Skip video frames until we see the first IDR (which includes SPS/PPS)
+		if !state.seenKeyframe {
+			switch pkt.Cid {
+			case mp4.MP4_CODEC_H264:
+				if !codec.IsH264IDRFrame(pkt.Data) {
+					continue
+				}
+				state.seenKeyframe = true
+			case mp4.MP4_CODEC_H265:
+				if !codec.IsH265IDRFrame(pkt.Data) {
+					continue
+				}
+				state.seenKeyframe = true
+			default:
+				// Audio: skip until we've seen a video keyframe
+				continue
+			}
 		}
-		pkt.Pts = pkt.Pts - state.firstDts[pkt.TrackId]
-		pkt.Dts = pkt.Dts - state.firstDts[pkt.TrackId]
-		pkt.TrackId = int(muxTrackId)
 
-		packets = append(packets, pkt)
-	}
+		// Normalize timestamps using a shared base for correct A/V sync
+		if !d.firstDtsSet {
+			d.firstDts = pkt.Dts
+			d.firstDtsSet = true
+		}
+		pts := pkt.Pts - d.firstDts
+		dts := pkt.Dts - d.firstDts
 
-	return packets, nil
-}
-
-// ProcessSegment demuxes a video segment and writes packets to the muxer.
-func (m *StreamFMP4Muxer) ProcessSegment(segmentData []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	packets, err := m.demuxSegment(m.InitSegment, segmentData, &m.video)
-	if err != nil {
-		return err
-	}
-	return m.writePackets(packets)
-}
-
-// ProcessAudioSegment demuxes an audio segment and writes packets to the muxer.
-func (m *StreamFMP4Muxer) ProcessAudioSegment(segmentData []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	initData := m.AudioInitSegment
-	if initData == nil {
-		initData = m.InitSegment
-	}
-	packets, err := m.demuxSegment(initData, segmentData, &m.audio)
-	if err != nil {
-		return err
-	}
-	return m.writePackets(packets)
-}
-
-// ProcessAudioVideoSegments demuxes both an audio and video segment, interleaves
-// packets by DTS, and writes them to the muxer. Audio is written before video at
-// the same DTS so it's included in the fragment before a keyframe triggers a flush.
-func (m *StreamFMP4Muxer) ProcessAudioVideoSegments(videoData, audioData []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	audioInitData := m.AudioInitSegment
-	if audioInitData == nil {
-		audioInitData = m.InitSegment
-	}
-
-	videoPackets, err := m.demuxSegment(m.InitSegment, videoData, &m.video)
-	if err != nil {
-		return fmt.Errorf("video demux: %w", err)
-	}
-	audioPackets, err := m.demuxSegment(audioInitData, audioData, &m.audio)
-	if err != nil {
-		return fmt.Errorf("audio demux: %w", err)
-	}
-
-	// Merge and sort by DTS, audio before video at same DTS
-	all := make([]*mp4.AVPacket, 0, len(videoPackets)+len(audioPackets))
-	all = append(all, videoPackets...)
-	all = append(all, audioPackets...)
-	sort.SliceStable(all, func(i, j int) bool {
-		return all[i].Dts < all[j].Dts
-	})
-
-	return m.writePackets(all)
-}
-
-func (m *StreamFMP4Muxer) writePackets(packets []*mp4.AVPacket) error {
-	for _, pkt := range packets {
-		if err := m.Muxer.Write(uint32(pkt.TrackId), pkt.Data, pkt.Pts, pkt.Dts); err != nil {
-			return fmt.Errorf("muxer.Write: %w", err)
+		// TS muxer expects milliseconds (converts to 90kHz internally)
+		if err := d.Muxer.Muxer.Write(streamId, pkt.Data, pts, dts); err != nil {
+			return fmt.Errorf("tsMuxer.Write: %w", err)
 		}
 	}
+
 	return nil
 }
 
-func (m *StreamFMP4Muxer) Close() error {
-	return m.Muxer.WriteTrailer()
+func (d *FMP4Demuxer) ProcessSegment(segmentData []byte) error {
+	return d.processSegment(d.InitSegment, segmentData, &d.video)
+}
+
+func (d *FMP4Demuxer) ProcessAudioSegment(segmentData []byte) error {
+	initData := d.AudioInitSegment
+	if initData == nil {
+		initData = d.InitSegment
+	}
+	return d.processSegment(initData, segmentData, &d.audio)
 }
