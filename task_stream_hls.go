@@ -58,17 +58,18 @@ type StreamHLSTask struct {
 	FMP4Demuxer *FMP4Demuxer `json:"-"`
 	TaskStats   *StreamStats `json:"taskStats"`
 
-	TaskType     DownloadType                    `json:"taskType"`
-	TaskVersion  DownloadVersion                 `json:"taskVersion"`
-	FileName     *atomic.String                  `json:"fileName"`
-	FileLocation *atomic.String                  `json:"fileLocation"`
-	PlayListUrl  *atomic.String                  `json:"playListUrl"`
-	BaseUrl      *url.URL                        `json:"-"`
-	Opts         []gokhttp_requests.Option       `json:"-"`
-	SegmentChan  chan SequencedSegment           `json:"-"`
-	BufferChan   chan SequencedBuffer            `json:"-"`
-	SegmentCache *hashmap.Map[string, time.Time] `json:"-"`
-	SaveSegments bool                            `json:"-"`
+	TaskType       DownloadType                    `json:"taskType"`
+	TaskVersion    DownloadVersion                 `json:"taskVersion"`
+	FileName       *atomic.String                  `json:"fileName"`
+	FileLocation   *atomic.String                  `json:"fileLocation"`
+	PlayListUrl    *atomic.String                  `json:"playListUrl"`
+	BaseUrl        *url.URL                        `json:"-"`
+	Opts           []gokhttp_requests.Option       `json:"-"`
+	SegmentChan    chan SequencedSegment           `json:"-"`
+	BufferChan     chan SequencedBuffer            `json:"-"`
+	SegmentCache   *hashmap.Map[string, time.Time] `json:"-"`
+	SaveSegments   bool                            `json:"-"`
+	segmentCounter *atomic.Uint64                  `json:"-"`
 
 	// Format detection (set during getSegments init)
 	Format     StreamFormat `json:"format"`
@@ -207,16 +208,17 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 			DownloadedDuration: atomic.NewInt64(0),
 			DownloadedBytes:    atomic.NewUint64(0),
 		},
-		FileName:     atomic.NewString(filepath.Base(fileLocation)),
-		FileLocation: atomic.NewString(fileLocation),
-		SegmentChan:  make(chan SequencedSegment),
-		BufferChan:   make(chan SequencedBuffer),
-		PlayListUrl:  atomic.NewString(playlistUrl),
-		BaseUrl:      baseUrl,
-		Opts:         opts,
-		SegmentCache: hashmap.New[string, time.Time](),
-		SaveSegments: saveSegments,
-		initDone:     make(chan struct{}),
+		FileName:       atomic.NewString(filepath.Base(fileLocation)),
+		FileLocation:   atomic.NewString(fileLocation),
+		SegmentChan:    make(chan SequencedSegment),
+		BufferChan:     make(chan SequencedBuffer),
+		PlayListUrl:    atomic.NewString(playlistUrl),
+		BaseUrl:        baseUrl,
+		Opts:           opts,
+		SegmentCache:   hashmap.New[string, time.Time](),
+		SaveSegments:   saveSegments,
+		segmentCounter: atomic.NewUint64(0),
+		initDone:       make(chan struct{}),
 	}
 	global.Tasks.Set(fileLocation, result)
 	return result, nil
@@ -438,8 +440,9 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 		st.FMP4Demuxer.SetInitSegment(initData)
 
 		if st.SaveSegments {
+			n := st.segmentCounter.Inc()
 			saveDir := filepath.Dir(st.FileLocation.Load())
-			_ = os.WriteFile(filepath.Join(saveDir, "init_video.mp4"), initData, 0666)
+			_ = os.WriteFile(filepath.Join(saveDir, fmt.Sprintf("%06d_init_video.mp4", n)), initData, 0666)
 		}
 
 		// Download audio init segment if separate audio
@@ -471,8 +474,9 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 				st.FMP4Demuxer.SetAudioInitSegment(audioInitData)
 
 				if st.SaveSegments {
+					n := st.segmentCounter.Inc()
 					saveDir := filepath.Dir(st.FileLocation.Load())
-					_ = os.WriteFile(filepath.Join(saveDir, "init_audio.mp4"), audioInitData, 0666)
+					_ = os.WriteFile(filepath.Join(saveDir, fmt.Sprintf("%06d_init_audio.mp4", n)), audioInitData, 0666)
 				}
 			}
 		}
@@ -645,7 +649,7 @@ func (st *StreamHLSTask) mergeFMP4Segments(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				return nil
+				return st.FMP4Demuxer.FlushAll()
 			case newBuffer := <-st.BufferChan:
 				err := st.FMP4Demuxer.ProcessSegment(newBuffer.Data)
 				if err != nil {
@@ -655,51 +659,18 @@ func (st *StreamHLSTask) mergeFMP4Segments(ctx context.Context) error {
 		}
 	}
 
-	// Collect audio+video by MSN and process in sequence order
-	nextMSN := -1
-	pendingVideo := map[int][]byte{}
-	pendingAudio := map[int][]byte{}
-
-	processPending := func() error {
-		for {
-			v, vOk := pendingVideo[nextMSN]
-			a, aOk := pendingAudio[nextMSN]
-			if !vOk || !aOk {
-				break
-			}
-			// Process audio first, then video for the same MSN
-			if err := st.FMP4Demuxer.ProcessAudioSegment(a); err != nil {
-				return fmt.Errorf("FMP4Demuxer.ProcessAudioSegment (MSN %d): %w", nextMSN, err)
-			}
-			if err := st.FMP4Demuxer.ProcessSegment(v); err != nil {
-				return fmt.Errorf("FMP4Demuxer.ProcessSegment (MSN %d): %w", nextMSN, err)
-			}
-			delete(pendingVideo, nextMSN)
-			delete(pendingAudio, nextMSN)
-			nextMSN++
-		}
-		return nil
-	}
-
+	// Process audio and video as they arrive — channels enforce per-stream ordering
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return st.FMP4Demuxer.FlushAll()
 		case newBuffer := <-st.BufferChan:
-			if nextMSN == -1 {
-				nextMSN = newBuffer.MSN
-			}
-			pendingVideo[newBuffer.MSN] = newBuffer.Data
-			if err := processPending(); err != nil {
-				return err
+			if err := st.FMP4Demuxer.ProcessSegment(newBuffer.Data); err != nil {
+				return fmt.Errorf("FMP4Demuxer.ProcessSegment: %w", err)
 			}
 		case newBuffer := <-st.AudioBufferChan:
-			if nextMSN == -1 {
-				nextMSN = newBuffer.MSN
-			}
-			pendingAudio[newBuffer.MSN] = newBuffer.Data
-			if err := processPending(); err != nil {
-				return err
+			if err := st.FMP4Demuxer.ProcessAudioSegment(newBuffer.Data); err != nil {
+				return fmt.Errorf("FMP4Demuxer.ProcessAudioSegment: %w", err)
 			}
 		}
 	}
@@ -752,8 +723,10 @@ func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
 				break
 			}
 			if st.SaveSegments {
+				n := st.segmentCounter.Inc()
 				fileLocation := filepath.Dir(st.FileLocation.Load())
-				f, err := os.OpenFile(filepath.Join(fileLocation, filepath.Base(seg.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
+				segName := fmt.Sprintf("%06d_video_%s", n, segmentFileName(seg.Segment))
+				f, err := os.OpenFile(filepath.Join(fileLocation, segName), os.O_CREATE|os.O_WRONLY, 0666)
 				if err != nil {
 					return fmt.Errorf("os.OpenFile: %w", err)
 				}
@@ -807,8 +780,10 @@ func (st *StreamHLSTask) downloadAudioSegments(ctx context.Context) {
 				break
 			}
 			if st.SaveSegments {
+				n := st.segmentCounter.Inc()
 				fileLocation := filepath.Dir(st.FileLocation.Load())
-				f, err := os.OpenFile(filepath.Join(fileLocation, "audio_"+filepath.Base(seg.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
+				segName := fmt.Sprintf("%06d_audio_%s", n, segmentFileName(seg.Segment))
+				f, err := os.OpenFile(filepath.Join(fileLocation, segName), os.O_CREATE|os.O_WRONLY, 0666)
 				if err != nil {
 					continue
 				}
@@ -832,6 +807,15 @@ func trySend[T any](ch chan T, val T, stop *atomic.Bool) bool {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+// segmentFileName extracts a clean filename from a segment URI, stripping query params.
+func segmentFileName(segmentURI string) string {
+	parsed, err := url.Parse(segmentURI)
+	if err != nil {
+		return filepath.Base(segmentURI)
+	}
+	return filepath.Base(parsed.Path)
 }
 
 func buildURLFromBase(baseUrl *url.URL, path string) string {

@@ -5,6 +5,7 @@ go 1.23
 require (
 	github.com/BRUHItsABunny/crypto-utils v0.0.5
 	github.com/BRUHItsABunny/gOkHttp v0.3.7
+	github.com/BRUHItsABunny/gomedia v0.0.0-20260412054511-10f18fd6ed32
 	github.com/cornelk/hashmap v1.0.8
 	github.com/dustin/go-humanize v1.0.1
 	github.com/etherlabsio/go-m3u8 v1.0.0
@@ -14,7 +15,6 @@ require (
 )
 
 require (
-	github.com/BRUHItsABunny/gomedia v0.0.0-20260411233747-44fcbeddf130 // indirect
 	github.com/OneOfOne/xxhash v1.2.8 // indirect
 	golang.org/x/net v0.23.0 // indirect
 	golang.org/x/text v0.14.0 // indirect
