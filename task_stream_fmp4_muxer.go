@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"sync"
 
@@ -56,18 +55,13 @@ type FMP4Demuxer struct {
 	maxAudioDts uint64
 	maxVideoDts uint64
 
-	debugLog *os.File
-	mu       sync.Mutex
+	mu sync.Mutex
 }
 
 func NewFMP4Demuxer(muxer *StreamMuxer) *FMP4Demuxer {
 	d := &FMP4Demuxer{Muxer: muxer}
 	// Apply initial TS delay for player compatibility
 	d.Muxer.Muxer.RebaseTimestamps(initialTSDelay)
-	f, err := os.OpenFile("fmp4_debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err == nil {
-		d.debugLog = f
-	}
 	return d
 }
 
@@ -263,16 +257,6 @@ func (d *FMP4Demuxer) processSegment(initData, segmentData []byte, state *fmp4Tr
 
 		pts := pkt.Pts - d.origin
 		dts := pkt.Dts - d.origin
-
-		if d.debugLog != nil {
-			streamType := "AUDIO"
-			if isVideo {
-				streamType = "VIDEO"
-			}
-			isIDR := isVideo && pkt.Cid == mp4.MP4_CODEC_H264 && codec.IsH264IDRFrame(pkt.Data)
-			fmt.Fprintf(d.debugLog, "%s codec=%d rawDts=%d rawPts=%d origin=%d outDts=%d outPts=%d len=%d idr=%v\n",
-				streamType, pkt.Cid, pkt.Dts, pkt.Pts, d.origin, dts, pts, len(pkt.Data), isIDR)
-		}
 
 		d.pending = append(d.pending, pendingPacket{
 			streamId: streamId,
