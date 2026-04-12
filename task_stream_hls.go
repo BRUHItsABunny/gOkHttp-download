@@ -61,6 +61,7 @@ type StreamHLSTask struct {
 	// Format detection (set during getSegments init)
 	Format     StreamFormat `json:"format"`
 	outputFile *os.File
+	initDone   chan struct{} // closed after getSegments finishes initialization
 
 	// Audio stream support
 	HasAudioStream    bool                            `json:"-"`
@@ -170,7 +171,7 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 		Opaque:     parsedUrl.Opaque,
 		User:       parsedUrl.User,
 		Host:       parsedUrl.Host,
-		Path:       strings.Join(pathSplit[:len(pathSplit)-1], "/"),
+		Path:       strings.Join(pathSplit[:len(pathSplit)-1], "/") + "/",
 		OmitHost:   parsedUrl.OmitHost,
 		ForceQuery: parsedUrl.ForceQuery,
 		RawQuery:   parsedUrl.RawQuery,
@@ -197,6 +198,7 @@ func NewStreamHLSTask(global *GlobalDownloadTracker, hClient *http.Client, playl
 		Opts:         opts,
 		SegmentCache: hashmap.New[string, time.Time](),
 		SaveSegments: saveSegments,
+		initDone:     make(chan struct{}),
 	}
 	global.Tasks.Set(fileLocation, result)
 	return result, nil
@@ -372,7 +374,7 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 						Opaque:     parsedAudioUrl.Opaque,
 						User:       parsedAudioUrl.User,
 						Host:       parsedAudioUrl.Host,
-						Path:       strings.Join(audioPathSplit[:len(audioPathSplit)-1], "/"),
+						Path:       strings.Join(audioPathSplit[:len(audioPathSplit)-1], "/") + "/",
 						OmitHost:   parsedAudioUrl.OmitHost,
 						ForceQuery: parsedAudioUrl.ForceQuery,
 						RawQuery:   parsedAudioUrl.RawQuery,
@@ -415,7 +417,7 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 			Opaque:     parsedMediaUrl.Opaque,
 			User:       parsedMediaUrl.User,
 			Host:       parsedMediaUrl.Host,
-			Path:       strings.Join(mediaPathSplit[:len(mediaPathSplit)-1], "/"),
+			Path:       strings.Join(mediaPathSplit[:len(mediaPathSplit)-1], "/") + "/",
 			OmitHost:   parsedMediaUrl.OmitHost,
 			ForceQuery: parsedMediaUrl.ForceQuery,
 			RawQuery:   parsedMediaUrl.RawQuery,
@@ -478,6 +480,9 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 		}()
 	}
 
+	// Signal that initialization is complete
+	close(st.initDone)
+
 	// Video segment polling loop
 	ticker := time.Tick(time.Second)
 	for {
@@ -507,7 +512,9 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 
 				_, ok := st.SegmentCache.Get(chunk.Segment)
 				if !ok {
-					st.SegmentChan <- chunk
+					if !trySend(st.SegmentChan, chunk, st.Global.GraceFulStop) {
+						break
+					}
 				}
 			}
 
@@ -555,7 +562,9 @@ func (st *StreamHLSTask) getAudioSegments(ctx context.Context) {
 
 				_, ok := st.AudioSegmentCache.Get(chunk.Segment)
 				if !ok {
-					st.AudioSegmentChan <- chunk
+					if !trySend(st.AudioSegmentChan, chunk, st.Global.GraceFulStop) {
+						break
+					}
 				}
 			}
 
@@ -571,6 +580,7 @@ func (st *StreamHLSTask) getAudioSegments(ctx context.Context) {
 }
 
 func (st *StreamHLSTask) mergeSegments() error {
+	<-st.initDone
 	if st.Format == StreamFormatFMP4 {
 		return st.mergeFMP4Segments()
 	}
@@ -633,28 +643,60 @@ func (st *StreamHLSTask) mergeTSAudioSegments() {
 }
 
 func (st *StreamHLSTask) mergeFMP4Segments() error {
-	if st.HasAudioStream {
-		st.audioWg.Add(1)
-		go func() {
-			defer st.audioWg.Done()
-			st.mergeFMP4AudioSegments()
-		}()
+	if !st.HasAudioStream {
+		// Video only: simple path
+		ticker := time.Tick(time.Second)
+		for {
+			select {
+			case <-ticker:
+				break
+			case newBuffer := <-st.BufferChan:
+				err := st.FMP4Muxer.ProcessSegment(newBuffer.Bytes())
+				if err != nil {
+					return fmt.Errorf("FMP4Muxer.ProcessSegment: %w", err)
+				}
+				break
+			}
+
+			if st.Global.GraceFulStop.Load() {
+				break
+			}
+		}
+		return nil
 	}
 
+	// Audio + video: collect both, interleave by DTS before writing
 	ticker := time.Tick(time.Second)
+	var pendingVideo []byte
+	var pendingAudio []byte
 	for {
 		select {
 		case <-ticker:
 			break
 		case newBuffer := <-st.BufferChan:
-			err := st.FMP4Muxer.ProcessSegment(newBuffer.Bytes())
+			pendingVideo = newBuffer.Bytes()
+		case newBuffer := <-st.AudioBufferChan:
+			pendingAudio = newBuffer.Bytes()
+		}
+
+		// When we have both, interleave and write together
+		if pendingVideo != nil && pendingAudio != nil {
+			err := st.FMP4Muxer.ProcessAudioVideoSegments(pendingVideo, pendingAudio)
 			if err != nil {
-				return fmt.Errorf("FMP4Muxer.ProcessSegment: %w", err)
+				return fmt.Errorf("FMP4Muxer.ProcessAudioVideoSegments: %w", err)
 			}
-			break
+			pendingVideo = nil
+			pendingAudio = nil
 		}
 
 		if st.Global.GraceFulStop.Load() {
+			// Flush any remaining pending segments
+			if pendingVideo != nil {
+				_ = st.FMP4Muxer.ProcessSegment(pendingVideo)
+			}
+			if pendingAudio != nil {
+				_ = st.FMP4Muxer.ProcessAudioSegment(pendingAudio)
+			}
 			break
 		}
 	}
@@ -662,27 +704,8 @@ func (st *StreamHLSTask) mergeFMP4Segments() error {
 	return nil
 }
 
-func (st *StreamHLSTask) mergeFMP4AudioSegments() {
-	ticker := time.Tick(time.Second)
-	for {
-		select {
-		case <-ticker:
-			break
-		case newBuffer := <-st.AudioBufferChan:
-			err := st.FMP4Muxer.ProcessAudioSegment(newBuffer.Bytes())
-			if err != nil {
-				continue
-			}
-			break
-		}
-
-		if st.Global.GraceFulStop.Load() {
-			break
-		}
-	}
-}
-
 func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
+	<-st.initDone
 	if st.HasAudioStream {
 		st.audioWg.Add(1)
 		go func() {
@@ -720,7 +743,9 @@ func (st *StreamHLSTask) downloadSegments(ctx context.Context) error {
 			st.Global.TotalBytes.Add(uint64(buf.Len()))
 			st.Global.DownloadedBytes.Add(uint64(buf.Len()))
 
-			st.BufferChan <- buf
+			if !trySend(st.BufferChan, buf, st.Global.GraceFulStop) {
+				break
+			}
 			if st.SaveSegments {
 				fileLocation := filepath.Dir(st.FileLocation.Load())
 				f, err := os.OpenFile(filepath.Join(fileLocation, filepath.Base(newChunk.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
@@ -780,7 +805,9 @@ func (st *StreamHLSTask) downloadAudioSegments(ctx context.Context) {
 			st.Global.TotalBytes.Add(uint64(buf.Len()))
 			st.Global.DownloadedBytes.Add(uint64(buf.Len()))
 
-			st.AudioBufferChan <- buf
+			if !trySend(st.AudioBufferChan, buf, st.Global.GraceFulStop) {
+				break
+			}
 			if st.SaveSegments {
 				fileLocation := filepath.Dir(st.FileLocation.Load())
 				f, err := os.OpenFile(filepath.Join(fileLocation, "audio_"+filepath.Base(newChunk.Segment)), os.O_CREATE|os.O_WRONLY, 0666)
@@ -795,6 +822,21 @@ func (st *StreamHLSTask) downloadAudioSegments(ctx context.Context) {
 
 		if st.Global.GraceFulStop.Load() {
 			break
+		}
+	}
+}
+
+// trySend attempts to send on ch but aborts if GraceFulStop is set.
+// Returns false if the send was aborted.
+func trySend[T any](ch chan T, val T, stop *atomic.Bool) bool {
+	for {
+		if stop.Load() {
+			return false
+		}
+		select {
+		case ch <- val:
+			return true
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }
