@@ -460,8 +460,8 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 			videoIdx = st.StreamSelector.VideoIndex
 			audioIdx = st.StreamSelector.AudioIndex
 		}
-		if videoIdx < 0 || videoIdx >= len(variants) {
-			return fmt.Errorf("video index %d out of range (0-%d)", videoIdx, len(variants)-1)
+		if videoIdx >= len(variants) {
+			videoIdx = len(variants) - 1
 		}
 
 		targetChunkStream := variants[videoIdx].PlaylistItem
@@ -480,8 +480,8 @@ func (st *StreamHLSTask) getSegments(ctx context.Context) error {
 			}
 
 			if len(matchingAudio) > 0 {
-				if audioIdx < 0 || audioIdx >= len(matchingAudio) {
-					return fmt.Errorf("audio index %d out of range (0-%d)", audioIdx, len(matchingAudio)-1)
+				if audioIdx >= len(matchingAudio) {
+					audioIdx = len(matchingAudio) - 1
 				}
 
 				audioMedia := matchingAudio[audioIdx].MediaItem
